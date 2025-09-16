@@ -1,0 +1,444 @@
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1, FORMAT_PERCENTAGE_00
+import warnings
+warnings.filterwarnings('ignore')
+
+class RankingAnalyzer:
+    def __init__(self):
+        # Define column mappings (Excel headers might be slightly different)
+        self.column_mappings = {
+            'profit_3yr': ['Profit Var 3Yrs%', 'Profit_Var_3YrsPercent'],
+            'profit_5yr': ['Profit Var 5Yrs%', 'Profit_Var_5YrsPercent'],
+            'return_3yr': ['3Yrs return%', '3Yrs_returnPercent'],
+            'return_5yr': ['5Yrs return%', '5Yrs_returnPercent'],
+            'roce': ['ROCE%', 'ROCEPercent'],
+            'asset_turnover': ['Asset Turnover', 'Asset_Turnover'],
+            'peg': ['PEG'],
+            'piotroski': ['Piotski Scr', 'Piotski_Scr'],
+            'pe': ['P/E', 'P_E'],
+            'pledged': ['Pledged%', 'PledgedPercent'],
+            'promoter': ['Prom. Hold.%', 'Prom_HoldPercent']
+        }
+        
+        # Columns that need higher rank for higher values
+        self.higher_is_better = ['roce', 'asset_turnover', 'piotroski']
+        
+        # Columns that need higher rank for lower values
+        self.lower_is_better = ['peg', 'pe']
+        
+        # New calculated columns that need higher rank for higher values
+        self.new_higher_is_better = ['Profit_Return_Diff_3Yr', 'Profit_Return_Diff_5Yr']
+    
+    def find_column_name(self, df, column_key):
+        """
+        Find the actual column name in the dataframe based on possible variants
+        """
+        possible_names = self.column_mappings.get(column_key, [column_key])
+        
+        for name in possible_names:
+            if name in df.columns:
+                return name
+        
+        return None
+    
+    def load_weighted_analysis_file(self, filename):
+        """
+        Load the weighted analysis Excel file with multiple sheets
+        """
+        try:
+            print(f"📖 Loading weighted analysis file: {filename}")
+            
+            # Load all sheets
+            excel_file = pd.ExcelFile(filename)
+            sheets = excel_file.sheet_names
+            print(f"   Found sheets: {sheets}")
+            
+            sheet_data = {}
+            
+            for sheet_name in sheets:
+                print(f"\n📊 Processing sheet: {sheet_name}")
+                df = pd.read_excel(filename, sheet_name=sheet_name)
+                
+                print(f"   Loaded {len(df)} rows with {len(df.columns)} columns")
+                print(f"   Columns: {list(df.columns)}")
+                
+                # Validate that this looks like a weighted analysis sheet
+                if len(df) == 0:
+                    print(f"   ⚠️ Empty sheet, skipping...")
+                    continue
+                
+                sheet_data[sheet_name] = df
+                print(f"   ✅ Sheet loaded successfully")
+            
+            if not sheet_data:
+                print("❌ No valid sheets found in the file!")
+                return None
+            
+            return sheet_data
+            
+        except Exception as e:
+            print(f"❌ Error loading file: {str(e)}")
+            return None
+    
+    def calculate_new_columns(self, df):
+        """
+        Calculate new columns: Profit - Returns for 3yr and 5yr
+        """
+        print("🧮 Calculating new difference columns...")
+        
+        # Find column names
+        profit_3yr_col = self.find_column_name(df, 'profit_3yr')
+        profit_5yr_col = self.find_column_name(df, 'profit_5yr')
+        return_3yr_col = self.find_column_name(df, 'return_3yr')
+        return_5yr_col = self.find_column_name(df, 'return_5yr')
+        
+        # Calculate Profit - Return differences
+        if profit_3yr_col and return_3yr_col:
+            df['Profit_Return_Diff_3Yr'] = df[profit_3yr_col] - df[return_3yr_col]
+            print(f"   ✅ Created Profit_Return_Diff_3Yr = {profit_3yr_col} - {return_3yr_col}")
+            
+            # Show sample calculation
+            sample_idx = df.dropna(subset=[profit_3yr_col, return_3yr_col]).index[:3]
+            for idx in sample_idx:
+                profit_val = df.loc[idx, profit_3yr_col]
+                return_val = df.loc[idx, return_3yr_col]
+                diff_val = df.loc[idx, 'Profit_Return_Diff_3Yr']
+                print(f"      Example: {profit_val:.2%} - {return_val:.2%} = {diff_val:.2%}")
+        else:
+            print(f"   ❌ Could not find 3-year profit/return columns")
+            print(f"      Looking for profit: {self.column_mappings['profit_3yr']}")
+            print(f"      Looking for return: {self.column_mappings['return_3yr']}")
+        
+        if profit_5yr_col and return_5yr_col:
+            df['Profit_Return_Diff_5Yr'] = df[profit_5yr_col] - df[return_5yr_col]
+            print(f"   ✅ Created Profit_Return_Diff_5Yr = {profit_5yr_col} - {return_5yr_col}")
+            
+            # Show sample calculation
+            sample_idx = df.dropna(subset=[profit_5yr_col, return_5yr_col]).index[:3]
+            for idx in sample_idx:
+                profit_val = df.loc[idx, profit_5yr_col]
+                return_val = df.loc[idx, return_5yr_col]
+                diff_val = df.loc[idx, 'Profit_Return_Diff_5Yr']
+                print(f"      Example: {profit_val:.2%} - {return_val:.2%} = {diff_val:.2%}")
+        else:
+            print(f"   ❌ Could not find 5-year profit/return columns")
+        
+        return df
+    
+    def calculate_rankings(self, df):
+        """
+        Calculate rankings for all relevant columns
+        """
+        print("\n🏆 Calculating rankings...")
+        
+        ranking_columns = []
+        
+        # PEG and PE - lower is better, get average rank
+        peg_col = self.find_column_name(df, 'peg')
+        pe_col = self.find_column_name(df, 'pe')
+        
+        if peg_col and pe_col:
+            print(f"📊 Ranking PEG and PE (lower is better)...")
+            
+            # Create individual rankings (ascending=True means lower values get rank 1)
+            df['PEG_Rank'] = df[peg_col].rank(ascending=True, na_option='bottom')
+            df['PE_Rank'] = df[pe_col].rank(ascending=True, na_option='bottom')
+            
+            # Calculate average rank for PEG and PE
+            df['PEG_PE_Avg_Rank'] = (df['PEG_Rank'] + df['PE_Rank']) / 2
+            ranking_columns.append('PEG_PE_Avg_Rank')
+            
+            print(f"   ✅ Created PEG_PE_Avg_Rank (average of PEG and PE ranks)")
+            
+            # Show sample rankings
+            sample_data = df[['PEG_Rank', 'PE_Rank', 'PEG_PE_Avg_Rank']].dropna().head(3)
+            for idx, row in sample_data.iterrows():
+                print(f"      Example: PEG Rank {row['PEG_Rank']:.1f}, PE Rank {row['PE_Rank']:.1f} → Avg: {row['PEG_PE_Avg_Rank']:.1f}")
+        
+        # Higher is better columns
+        higher_better_cols = []
+        
+        # Find existing columns that are higher-is-better
+        for col_key in self.higher_is_better:
+            col_name = self.find_column_name(df, col_key)
+            if col_name:
+                higher_better_cols.append(col_name)
+        
+        # Add new calculated columns
+        for new_col in self.new_higher_is_better:
+            if new_col in df.columns:
+                higher_better_cols.append(new_col)
+        
+        print(f"\n📈 Ranking higher-is-better columns: {higher_better_cols}")
+        
+        for col in higher_better_cols:
+            rank_col_name = f"{col}_Rank"
+            df[rank_col_name] = df[col].rank(ascending=False, na_option='bottom')  # Higher values get rank 1
+            ranking_columns.append(rank_col_name)
+            
+            # Show sample rankings
+            sample_data = df[[col, rank_col_name]].dropna().head(3)
+            print(f"   ✅ {col} → {rank_col_name}")
+            for idx, row in sample_data.iterrows():
+                col_val = row[col]
+                rank_val = row[rank_col_name]
+                if col in ['Profit_Return_Diff_3Yr', 'Profit_Return_Diff_5Yr']:
+                    print(f"      Value: {col_val:.2%} → Rank: {rank_val:.1f}")
+                elif col in ['ROCEPercent', 'ROCE%']:
+                    print(f"      Value: {col_val:.2%} → Rank: {rank_val:.1f}")
+                else:
+                    print(f"      Value: {col_val:.2f} → Rank: {rank_val:.1f}")
+        
+        # Calculate total rank (sum of all individual ranks)
+        if ranking_columns:
+            print(f"\n🎯 Calculating Total Rank from {len(ranking_columns)} ranking columns...")
+            df['Total_Rank_Score'] = df[ranking_columns].sum(axis=1, skipna=True)
+            
+            # Final ranking - higher total rank score gets better rank
+            df['Final_Rank'] = df['Total_Rank_Score'].rank(ascending=False, na_option='bottom')
+            
+            print(f"   ✅ Created Total_Rank_Score and Final_Rank")
+            
+            # Show top 3 final rankings
+            top_rankings = df.nsmallest(3, 'Final_Rank')
+            print(f"\n🏅 Top 3 Final Rankings:")
+            grouping_col = df.columns[0]  # Assuming first column is the grouping column
+            
+            for idx, row in top_rankings.iterrows():
+                name = row[grouping_col]
+                final_rank = row['Final_Rank']
+                total_score = row['Total_Rank_Score']
+                print(f"   {final_rank:.0f}. {name} (Total Score: {total_score:.1f})")
+        
+        return df
+    
+    def format_excel_sheet(self, worksheet, df, sheet_name):
+        """
+        Apply professional formatting to the Excel sheet
+        """
+        try:
+            print(f"🎨 Formatting sheet: {sheet_name}")
+            
+            # Header formatting
+            header_font = Font(bold=True, color='FFFFFF', size=11)
+            header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+            center_alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Apply header formatting
+            for col_num in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=1, column=col_num)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+            
+            # Format percentage columns
+            percentage_columns = [col for col in df.columns if any(x in col.lower() for x in ['%', 'percent', 'diff'])]
+            for col_name in percentage_columns:
+                if col_name in df.columns:
+                    col_idx = list(df.columns).index(col_name) + 1
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for row in range(2, len(df) + 2):
+                        cell = worksheet[f'{col_letter}{row}']
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            cell.number_format = '0.00%'
+            
+            # Format ranking columns
+            rank_columns = [col for col in df.columns if 'rank' in col.lower()]
+            for col_name in rank_columns:
+                if col_name in df.columns:
+                    col_idx = list(df.columns).index(col_name) + 1
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for row in range(2, len(df) + 2):
+                        cell = worksheet[f'{col_letter}{row}']
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            cell.number_format = '0.0'
+            
+            # Format numeric columns
+            numeric_columns = ['Asset_Turnover', 'Asset Turnover', 'PEG', 'Piotski_Scr', 'Piotski Scr', 
+                             'P_E', 'P/E', 'Total_Companies', 'Total_Market_Cap_Cr']
+            for col_name in numeric_columns:
+                if col_name in df.columns:
+                    col_idx = list(df.columns).index(col_name) + 1
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for row in range(2, len(df) + 2):
+                        cell = worksheet[f'{col_letter}{row}']
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            if 'companies' in col_name.lower():
+                                cell.number_format = '0'
+                            elif 'market_cap' in col_name.lower():
+                                cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
+                            else:
+                                cell.number_format = '0.00'
+            
+            # Auto-adjust column widths
+            for col in worksheet.columns:
+                max_length = 0
+                column_letter = col[0].column_letter
+                
+                for cell in col:
+                    try:
+                        cell_length = len(str(cell.value)) if cell.value is not None else 0
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except:
+                        pass
+                
+                adjusted_width = min(max(max_length + 2, 12), 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"   ✅ Applied formatting to {sheet_name}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Warning: Could not apply formatting to {sheet_name}: {str(e)}")
+    
+    def process_weighted_analysis(self, input_filename, output_filename):
+        """
+        Main function to process weighted analysis file and add rankings
+        """
+        print("\n" + "="*80)
+        print("🏆 WEIGHTED ANALYSIS RANKING PROCESSOR")
+        print("="*80)
+        print("📊 Adding calculated columns and rankings to weighted analysis")
+        print("🧮 New columns: Profit-Return differences for 3yr and 5yr")
+        print("🏅 Rankings: PEG/PE average + individual metrics + final combined rank")
+        print("="*80)
+        
+        # Load the weighted analysis file
+        sheet_data = self.load_weighted_analysis_file(input_filename)
+        
+        if not sheet_data:
+            return False
+        
+        # Process each sheet
+        processed_sheets = {}
+        
+        for sheet_name, df in sheet_data.items():
+            print(f"\n" + "="*50)
+            print(f"📊 PROCESSING SHEET: {sheet_name}")
+            print("="*50)
+            
+            # Make a copy of the dataframe
+            processed_df = df.copy()
+            
+            # Calculate new columns
+            processed_df = self.calculate_new_columns(processed_df)
+            
+            # Calculate rankings
+            processed_df = self.calculate_rankings(processed_df)
+            
+            # Sort by final rank
+            if 'Final_Rank' in processed_df.columns:
+                processed_df = processed_df.sort_values('Final_Rank', ascending=True)
+                processed_df = processed_df.reset_index(drop=True)
+                print(f"   ✅ Sorted by Final_Rank")
+            
+            processed_sheets[sheet_name] = processed_df
+            print(f"   ✅ Sheet processing completed")
+        
+        # Save to new Excel file
+        print(f"\n💾 Saving ranked analysis to: {output_filename}")
+        
+        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+            for sheet_name, df in processed_sheets.items():
+                # Write data to sheet
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                # Apply formatting
+                worksheet = writer.sheets[sheet_name]
+                self.format_excel_sheet(worksheet, df, sheet_name)
+        
+        # Summary
+        print(f"\n🎉 RANKING ANALYSIS COMPLETED!")
+        print(f"📊 Processed {len(processed_sheets)} sheets")
+        print(f"📁 Output saved as: {output_filename}")
+        
+        for sheet_name, df in processed_sheets.items():
+            print(f"\n📈 {sheet_name} Summary:")
+            print(f"   • Total records: {len(df)}")
+            if 'Final_Rank' in df.columns:
+                top_entry = df.iloc[0]
+                grouping_col = df.columns[0]
+                print(f"   • Top ranked: {top_entry[grouping_col]} (Final Rank: {top_entry['Final_Rank']:.0f})")
+        
+        print(f"\n✅ SUCCESS! Open {output_filename} to view your ranked analysis.")
+        
+        return True
+
+
+def main():
+    """
+    Main function to run the ranking analysis
+    """
+    print("🏆 WEIGHTED ANALYSIS RANKING TOOL")
+    print("="*60)
+    print("📊 This tool processes weighted analysis Excel files and adds:")
+    print("   • New columns: Profit-Return differences (3yr & 5yr)")
+    print("   • Rankings: PEG/PE average ranking")
+    print("   • Rankings: Individual metric rankings") 
+    print("   • Final combined ranking")
+    print("\n🎯 Ranking Logic:")
+    print("   • PEG & PE: Lower is better")
+    print("   • ROCE, Asset Turnover, Piotroski, Differences: Higher is better")
+    print("   • Final Rank: Based on sum of all individual ranks")
+    print("="*60)
+    
+    # Create analyzer instance
+    analyzer = RankingAnalyzer()
+    
+    # Get input filename
+    while True:
+        input_filename = input("\n📁 Enter the weighted analysis Excel filename: ").strip()
+        
+        if not input_filename:
+            print("❌ Please enter a filename.")
+            continue
+        
+        # Add .xlsx extension if missing
+        if not input_filename.lower().endswith('.xlsx'):
+            input_filename += '.xlsx'
+        
+        # Check if file exists
+        try:
+            pd.read_excel(input_filename, nrows=1)
+            print(f"✅ File found: {input_filename}")
+            break
+        except FileNotFoundError:
+            print(f"❌ File not found: {input_filename}")
+            print("   Please make sure the file exists in the current directory.")
+            continue
+        except Exception as e:
+            print(f"❌ Error reading file: {str(e)}")
+            continue
+    
+    # Get output filename
+    output_filename = input("\n📝 Enter the name for the new ranked Excel file: ").strip()
+    
+    if not output_filename:
+        # Generate default name
+        output_filename = input_filename.replace('.xlsx', '_Ranked.xlsx')
+        print(f"📁 Using default name: {output_filename}")
+    elif not output_filename.lower().endswith('.xlsx'):
+        output_filename += '.xlsx'
+    
+    # Run ranking analysis
+    success = analyzer.process_weighted_analysis(input_filename, output_filename)
+    
+    if success:
+        print(f"\n🎯 MISSION ACCOMPLISHED!")
+        print(f"   Your ranked analysis is ready with comprehensive rankings!")
+        print(f"   All metrics have been properly ranked and combined into a final score!")
+    else:
+        print(f"\n❌ Analysis failed. Please check your data and try again.")
+    
+    input(f"\nPress Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
