@@ -1,0 +1,1316 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+from urllib.parse import urljoin, urlparse
+import time
+import json
+
+class ScreenerScraper:
+    def __init__(self):
+        self.base_url = "https://www.screener.in"
+        self.session = requests.Session()
+        self.logged_in = False
+        
+        # Enhanced headers to mimic a real browser
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        self.session.headers.update(self.headers)
+    
+    def is_likely_company_name(self, value, debug=False):
+        """
+        Enhanced detection for company names and text that should remain as text
+        """
+        if pd.isna(value) or value is None or value == '':
+            return False
+        
+        value_str = str(value).strip()
+        
+        # If it's clearly a number already, it's not a company name
+        if isinstance(value, (int, float)):
+            return False
+        
+        # Very short values are unlikely to be company names
+        if len(value_str) <= 2:
+            return False
+        
+        # If it contains only numbers, percentages, currency symbols, it's numeric data
+        numeric_indicators = ['%', '₹', 'Rs', 'cr', 'Cr', 'L', 'lakh', 'K', 'M', 'B']
+        if any(indicator in value_str for indicator in numeric_indicators):
+            return False
+        
+        # If it's mostly numbers, it's probably numeric data
+        digit_count = sum(1 for char in value_str if char.isdigit())
+        if len(value_str) > 0 and digit_count / len(value_str) > 0.6:
+            return False
+        
+        # Check for obvious company name indicators
+        company_indicators = [
+            'ltd', 'limited', 'inc', 'corp', 'pvt', 'private', 'public',
+            'company', 'industries', 'group', 'holdings', 'ventures',
+            'technologies', 'services', 'solutions', 'systems',
+            'international', 'global', 'trading', 'exports', 'imports',
+            'enterprises', 'corporation', 'manufacturing', 'co.',
+            'pharmaceuticals', 'chemicals', 'steel', 'power', 'energy',
+            'communications', 'infrastructure', 'engineering', 'finance',
+            'textiles', 'motors', 'electronics', 'software', 'tech',
+            'bank', 'financial', 'insurance', 'capital', 'investment'
+        ]
+        
+        value_lower = value_str.lower()
+        has_company_indicator = any(indicator in value_lower for indicator in company_indicators)
+        
+        # If it has company indicators AND is reasonably long, it's likely a company name
+        if has_company_indicator and len(value_str) >= 8:
+            if debug:
+                print(f"'{value_str}' identified as company name (has indicators + good length)")
+            return True
+        
+        # If it's a long string with multiple words and no numbers, likely a company name
+        words = value_str.split()
+        if len(words) >= 2 and len(value_str) >= 10:
+            # Check if it's mostly alphabetic
+            alpha_chars = sum(1 for char in value_str if char.isalpha())
+            if alpha_chars / len(value_str) > 0.7:  # 70% alphabetic characters
+                if debug:
+                    print(f"'{value_str}' identified as company name (multi-word + mostly alphabetic)")
+                return True
+        
+        # Check for specific patterns that are clearly company names
+        # Pattern: "Word Word Ltd" or "Word Industries" etc.
+        if len(words) >= 2:
+            last_word = words[-1].lower()
+            if last_word in ['ltd', 'limited', 'inc', 'corp', 'pvt', 'co.', 'company']:
+                if debug:
+                    print(f"'{value_str}' identified as company name (ends with company suffix)")
+                return True
+        
+        # If it looks like a ticker symbol (short, all caps, mostly letters)
+        if len(value_str) <= 6 and value_str.isupper() and value_str.isalpha():
+            if debug:
+                print(f"'{value_str}' identified as ticker symbol (keeping as text)")
+            return True
+        
+        if debug:
+            print(f"'{value_str}' NOT identified as company name")
+        
+        return False
+    
+    def convert_to_number(self, value, debug=False):
+        """
+        Enhanced function to convert string values to appropriate numeric types
+        Now properly preserves company names and text values
+        """
+        if pd.isna(value) or value is None or value == '':
+            return None
+        
+        # Convert to string if not already
+        original_value = str(value).strip()
+        
+        # Return as-is if it's already a number
+        if isinstance(value, (int, float)):
+            return value
+        
+        # Check if this should remain as text (company names, etc.)
+        if self.is_likely_company_name(original_value, debug=debug):
+            return original_value
+        
+        # Clean the string for numeric conversion
+        cleaned_value = original_value
+        
+        # Handle special cases first
+        if cleaned_value.lower() in ['n/a', 'na', 'nil', 'null', '-', '--', '']:
+            return 0.0  # Convert null values to 0 for numeric consistency
+        
+        # Remove currency symbols and common prefixes
+        cleaned_value = re.sub(r'^Rs\.?\s*', '', cleaned_value)
+        cleaned_value = re.sub(r'₹\s*', '', cleaned_value)
+        cleaned_value = re.sub(r'^\$\s*', '', cleaned_value)
+        
+        # Handle percentage
+        is_percentage = '%' in cleaned_value
+        cleaned_value = cleaned_value.replace('%', '')
+        
+        # Handle negative numbers (keep track of sign)
+        is_negative = False
+        if cleaned_value.startswith('(') and cleaned_value.endswith(')'):
+            is_negative = True
+            cleaned_value = cleaned_value[1:-1]
+        elif cleaned_value.startswith('-'):
+            is_negative = True
+            cleaned_value = cleaned_value[1:]
+        
+        # Remove commas and spaces
+        cleaned_value = cleaned_value.replace(',', '').replace(' ', '')
+        
+        # Handle Indian numbering suffixes (Cr, L, K, etc.)
+        multiplier = 1
+        suffix_multipliers = {
+            'cr': 10000000,      # 1 Crore = 10 Million
+            'crore': 10000000,
+            'crores': 10000000,
+            'l': 100000,         # 1 Lakh = 100 Thousand
+            'lakh': 100000,
+            'lakhs': 100000,
+            'k': 1000,          # 1 Thousand
+            'thousand': 1000,
+            'm': 1000000,       # 1 Million
+            'million': 1000000,
+            'b': 1000000000,    # 1 Billion
+            'billion': 1000000000
+        }
+        
+        # Check for suffix (case insensitive)
+        for suffix, mult in suffix_multipliers.items():
+            if cleaned_value.lower().endswith(suffix):
+                multiplier = mult
+                cleaned_value = cleaned_value[:-len(suffix)]
+                break
+        
+        # Remove any remaining non-numeric characters except decimal point
+        cleaned_value = re.sub(r'[^\d.]', '', cleaned_value)
+        
+        if not cleaned_value or cleaned_value == '.':
+            # If after cleaning there's nothing numeric, check if original looked like text
+            if any(char.isalpha() for char in original_value):
+                return original_value  # Keep as text
+            else:
+                return 0.0  # Convert empty values to 0
+        
+        try:
+            # Convert to float
+            numeric_value = float(cleaned_value) * multiplier
+            
+            # Apply negative sign if needed
+            if is_negative:
+                numeric_value = -numeric_value
+            
+            # Convert to int if it's a whole number and not a percentage and not too large
+            if not is_percentage and numeric_value.is_integer() and abs(numeric_value) < 1e15:
+                numeric_value = int(numeric_value)
+            
+            if debug:
+                print(f"Converted '{original_value}' -> {numeric_value} ({'%' if is_percentage else 'number'})")
+            
+            return numeric_value
+            
+        except (ValueError, TypeError):
+            # If conversion fails, try one more time with more aggressive cleaning
+            try:
+                # Extract just numbers and decimal points
+                numbers_only = re.findall(r'\d+\.?\d*', original_value)
+                if numbers_only:
+                    base_value = float(numbers_only[0])
+                    
+                    # Apply multipliers based on text content
+                    if any(term in original_value.lower() for term in ['cr', 'crore']):
+                        base_value *= 10000000
+                    elif any(term in original_value.lower() for term in ['l', 'lakh']):
+                        base_value *= 100000
+                    elif 'k' in original_value.lower():
+                        base_value *= 1000
+                    
+                    # Handle negatives
+                    if '(' in original_value and ')' in original_value or original_value.startswith('-'):
+                        base_value = -base_value
+                    
+                    if debug:
+                        print(f"Fallback conversion '{original_value}' -> {base_value}")
+                    
+                    return int(base_value) if base_value.is_integer() else base_value
+                
+            except:
+                pass
+            
+            # Final fallback: if it contains any letters, keep as text
+            if any(char.isalpha() for char in original_value):
+                if debug:
+                    print(f"Keeping '{original_value}' as text (contains letters)")
+                return original_value
+            
+            # If it looks numeric but conversion failed, set to 0
+            if any(char in original_value for char in '0123456789'):
+                if debug:
+                    print(f"Could not convert '{original_value}' to number, setting to 0")
+                return 0.0
+            
+            # Keep as text for anything else
+            if debug:
+                print(f"Keeping '{original_value}' as text")
+            return original_value
+    
+    def login(self, email="Dhruvpuri1346@gmail.com", password="Naveen41118"):
+        """
+        Login to Screener.in with the provided credentials
+        """
+        print("\n🔐 Starting login process...")
+        
+        try:
+            # First, get the login page to extract any required tokens/forms
+            login_url = f"{self.base_url}/login/"
+            print(f"   Fetching login page: {login_url}")
+            
+            response = self.session.get(login_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Look for login form
+            login_form = soup.find('form')
+            if not login_form:
+                print("   ❌ Could not find login form")
+                return False
+            
+            # Extract CSRF token if present
+            csrf_token = None
+            csrf_input = soup.find('input', {'name': 'csrfmiddlewaretoken'})
+            if csrf_input:
+                csrf_token = csrf_input.get('value')
+                print(f"   Found CSRF token: {csrf_token[:20]}...")
+            
+            # Prepare login data
+            login_data = {
+                'username': email,
+                'password': password,
+            }
+            
+            if csrf_token:
+                login_data['csrfmiddlewaretoken'] = csrf_token
+            
+            # Extract form action URL
+            form_action = login_form.get('action', '/login/')
+            if not form_action.startswith('http'):
+                form_action = urljoin(self.base_url, form_action)
+            
+            print(f"   Submitting login to: {form_action}")
+            
+            # Add referer header for login
+            login_headers = self.headers.copy()
+            login_headers['Referer'] = login_url
+            login_headers['Origin'] = self.base_url
+            
+            # Submit login
+            login_response = self.session.post(
+                form_action,
+                data=login_data,
+                headers=login_headers,
+                timeout=30,
+                allow_redirects=True
+            )
+            
+            print(f"   Login response status: {login_response.status_code}")
+            print(f"   Final URL after login: {login_response.url}")
+            
+            # Check if login was successful
+            # Method 1: Check if we're redirected to dashboard or market page
+            if 'login' not in login_response.url.lower():
+                print("   ✅ Login successful (redirected away from login page)")
+                self.logged_in = True
+                return True
+            
+            # Method 2: Check the response content for success indicators
+            login_soup = BeautifulSoup(login_response.content, 'html.parser')
+            
+            # Look for error messages
+            error_messages = login_soup.find_all(['div', 'span', 'p'], class_=re.compile(r'error|alert|warning', re.I))
+            if error_messages:
+                error_text = ' '.join([msg.get_text(strip=True) for msg in error_messages])
+                print(f"   ⚠️ Possible error messages: {error_text}")
+            
+            # Look for success indicators (user menu, logout link, etc.)
+            success_indicators = [
+                login_soup.find('a', href='/logout/'),
+                login_soup.find('a', text=re.compile(r'logout|sign out', re.I)),
+                login_soup.find_all('a', href=re.compile(r'/screens/|/market/')),
+            ]
+            
+            if any(success_indicators):
+                print("   ✅ Login successful (found user session indicators)")
+                self.logged_in = True
+                return True
+            
+            # Method 3: Try to access a protected page
+            test_url = f"{self.base_url}/market/"
+            test_response = self.session.get(test_url, timeout=30)
+            
+            if test_response.status_code == 200:
+                test_soup = BeautifulSoup(test_response.content, 'html.parser')
+                
+                # Look for "Edit Columns" button or similar authenticated features
+                edit_columns = test_soup.find('button', text=re.compile(r'edit.*column', re.I))
+                if edit_columns:
+                    print("   ✅ Login successful (can access authenticated features)")
+                    self.logged_in = True
+                    return True
+            
+            print("   ❌ Login may have failed - proceeding anyway")
+            return False
+            
+        except Exception as e:
+            print(f"   ❌ Login error: {str(e)}")
+            return False
+    
+    def extract_breadcrumb_hierarchy(self, soup, debug=False):
+        """
+        Enhanced breadcrumb extraction with login-aware features
+        """
+        hierarchy = {
+            'Industry': 'Industries',
+            'Driving_Category': '',
+            'Category': '',
+            'Sector': '',
+            'Sub_Category': ''
+        }
+        
+        if debug:
+            print("\n🔍 DEBUG: Starting breadcrumb extraction...")
+        
+        try:
+            # Method 1: Look for breadcrumb navigation containers with various selectors
+            breadcrumb_selectors = [
+                'nav[aria-label*="breadcrumb"]',
+                '.breadcrumb',
+                'ol.breadcrumb',
+                'ul.breadcrumb',
+                'div.breadcrumb',
+                '.nav-breadcrumb',
+                '.breadcrumbs',
+                'nav',
+                '.navigation-path',
+                '.path-navigation'
+            ]
+            
+            breadcrumb_container = None
+            
+            for selector in breadcrumb_selectors:
+                containers = soup.select(selector)
+                for container in containers:
+                    container_text = container.get_text().lower()
+                    if 'industries' in container_text:
+                        breadcrumb_container = container
+                        if debug:
+                            print(f"Found breadcrumb container using selector: {selector}")
+                        break
+                if breadcrumb_container:
+                    break
+            
+            # Method 2: Look for page title or heading that might contain hierarchy
+            if not breadcrumb_container:
+                title_elements = soup.find_all(['h1', 'h2', 'h3', '.page-title', '.section-title'])
+                for title in title_elements:
+                    title_text = title.get_text(strip=True)
+                    if len(title_text) > 5 and any(word in title_text.lower() for word in ['companies', 'industry', 'sector']):
+                        # This might be our industry name
+                        hierarchy['Sub_Category'] = title_text
+                        if debug:
+                            print(f"Found potential sub-category from title: {title_text}")
+            
+            # Method 3: Enhanced link-based extraction
+            if breadcrumb_container:
+                links = breadcrumb_container.find_all('a')
+                text_items = []
+                
+                for link in links:
+                    text = link.get_text(strip=True)
+                    if text and text.lower() not in ['home', 'login', 'screens', 'dashboard', '']:
+                        text_items.append(text)
+                
+                # Also look for non-link text in breadcrumbs
+                all_text = breadcrumb_container.get_text(separator=' > ', strip=True)
+                if '>' in all_text:
+                    text_parts = [part.strip() for part in all_text.split('>')]
+                    text_parts = [part for part in text_parts if part and part.lower() not in ['home', 'login', 'screens', 'dashboard']]
+                    if len(text_parts) > len(text_items):
+                        text_items = text_parts
+                
+                if debug:
+                    print(f"Extracted breadcrumb items: {text_items}")
+                
+                # Find Industries and map hierarchy
+                industries_index = -1
+                for i, item in enumerate(text_items):
+                    if item.lower() == 'industries':
+                        industries_index = i
+                        break
+                
+                if industries_index >= 0:
+                    remaining = text_items[industries_index + 1:]
+                    if len(remaining) >= 1:
+                        hierarchy['Driving_Category'] = remaining[0]
+                    if len(remaining) >= 2:
+                        hierarchy['Category'] = remaining[1]
+                    if len(remaining) >= 3:
+                        hierarchy['Sector'] = remaining[2]
+                    if len(remaining) >= 4:
+                        hierarchy['Sub_Category'] = remaining[3]
+            
+            # Method 4: URL-based extraction as fallback
+            if not any(hierarchy.values()[1:]):
+                current_url = soup.find('meta', property='og:url')
+                if current_url:
+                    url = current_url.get('content', '')
+                elif hasattr(soup, 'url'):
+                    url = soup.url
+                else:
+                    url = ''
+                
+                if '/market/' in url:
+                    # Extract from URL path
+                    path_parts = url.split('/market/')[-1].split('/')
+                    path_parts = [part for part in path_parts if part and part != '']
+                    
+                    # Map URL segments to hierarchy (this is speculative)
+                    if len(path_parts) >= 1:
+                        hierarchy['Sub_Category'] = path_parts[-1].replace('-', ' ').title()
+            
+            if debug:
+                print(f"Final extracted hierarchy: {hierarchy}")
+            
+        except Exception as e:
+            if debug:
+                print(f"Error extracting hierarchy: {str(e)}")
+        
+        return hierarchy
+    
+    def identify_column_types(self, headers, sample_rows, debug=False):
+        """
+        Intelligently identify which columns should remain as text vs numeric
+        """
+        column_types = {}  # True = keep as text, False = convert to numeric
+        
+        for i, header in enumerate(headers):
+            header_lower = header.lower().strip()
+            
+            # Obvious text columns based on header names
+            text_keywords = [
+                'name', 'company', 'symbol', 'ticker', 'sector', 'industry',
+                'category', 'type', 'description', 'note', 'remark'
+            ]
+            
+            is_text_column = any(keyword in header_lower for keyword in text_keywords)
+            
+            if debug:
+                print(f"Header '{header}' - Text indicators: {is_text_column}")
+            
+            # If not obviously a text column, check sample data
+            if not is_text_column and sample_rows:
+                sample_values = []
+                for row in sample_rows[:5]:  # Check first 5 rows
+                    if i < len(row):
+                        cell_value = row[i].get_text(strip=True) if hasattr(row[i], 'get_text') else str(row[i])
+                        if cell_value:
+                            sample_values.append(cell_value)
+                
+                # Check if sample values look like company names
+                company_name_count = 0
+                for value in sample_values:
+                    if self.is_likely_company_name(value):
+                        company_name_count += 1
+                
+                # If more than 50% of samples look like company names, keep as text
+                if sample_values and company_name_count / len(sample_values) > 0.5:
+                    is_text_column = True
+                    if debug:
+                        print(f"Column {i} ('{header}') identified as text based on sample data")
+            
+            column_types[i] = is_text_column
+        
+        return column_types
+    
+    def extract_company_data(self, soup, industry_name, hierarchy, debug=False):
+        """
+        Enhanced company data extraction with intelligent text vs numeric detection
+        """
+        companies_data = []
+        
+        if debug:
+            print("\n🔍 DEBUG: Starting company data extraction...")
+        
+        try:
+            # Look for data tables with various selectors
+            table_selectors = [
+                'table',
+                '.data-table',
+                '.table',
+                '.companies-table',
+                '.responsive-holder table',
+                '[role="table"]'
+            ]
+            
+            table = None
+            for selector in table_selectors:
+                tables = soup.select(selector)
+                for t in tables:
+                    # Check if this table contains company data
+                    table_text = t.get_text().lower()
+                    if any(indicator in table_text for indicator in ['company', 'cmp', 'market cap', 'sales', 'profit']):
+                        table = t
+                        if debug:
+                            print(f"Found data table using selector: {selector}")
+                        break
+                if table:
+                    break
+            
+            if not table:
+                if debug:
+                    print("No suitable data table found")
+                return companies_data
+            
+            # Extract headers
+            headers = []
+            
+            # Try multiple methods to find headers
+            header_sources = [
+                table.select('thead tr th'),
+                table.select('thead tr td'),
+                table.select('tr:first-child th'),
+                table.select('tr:first-child td'),
+            ]
+            
+            for header_source in header_sources:
+                if header_source:
+                    headers = [th.get_text(strip=True) for th in header_source]
+                    headers = [h for h in headers if h]  # Remove empty headers
+                    if headers:
+                        break
+            
+            if debug:
+                print(f"Found headers: {headers}")
+            
+            if not headers:
+                if debug:
+                    print("No headers found")
+                return companies_data
+            
+            # Extract data rows for analysis
+            tbody = table.find('tbody')
+            if not tbody:
+                tbody = table
+            
+            rows = tbody.find_all('tr')
+            
+            # Skip header row if it's included in tbody
+            start_index = 0
+            if rows and len(rows) > 0:
+                first_row_cells = [cell.get_text(strip=True) for cell in rows[0].find_all(['td', 'th'])]
+                # If first row matches headers exactly, skip it
+                if first_row_cells == headers:
+                    start_index = 1
+            
+            # Get sample rows for column type analysis
+            sample_rows = []
+            for row in rows[start_index:start_index+5]:  # First 5 data rows
+                cells = row.find_all(['td', 'th'])
+                if len(cells) > 0:
+                    sample_rows.append(cells)
+            
+            # Identify column types
+            column_types = self.identify_column_types(headers, sample_rows, debug=debug)
+            
+            # Extract data rows
+            for i, row in enumerate(rows[start_index:], start=1):
+                cells = row.find_all(['td', 'th'])
+                if len(cells) == 0:
+                    continue
+                
+                # Create base row data with hierarchy info
+                row_data = {
+                    'Industry_Name': industry_name,
+                    'Industry': hierarchy['Industry'],
+                    'Driving_Category': hierarchy['Driving_Category'],
+                    'Category': hierarchy['Category'],
+                    'Sector': hierarchy['Sector'],
+                    'Sub_Category': hierarchy['Sub_Category']
+                }
+                
+                # Extract cell data with intelligent type handling
+                for j, cell in enumerate(cells):
+                    if j < len(headers):
+                        header = headers[j]
+                        cell_text = cell.get_text(strip=True)
+                        
+                        # Clean header names for column naming
+                        clean_header = (header.replace('.', '')
+                                             .replace('Rs.', 'Rs')
+                                             .replace('Rs.Cr.', 'Rs_Cr')
+                                             .replace('%', 'Percent')
+                                             .replace(' ', '_')
+                                             .replace('/', '_')
+                                             .replace('(', '')
+                                             .replace(')', ''))
+                        
+                        # Use intelligent type detection
+                        if column_types.get(j, False):  # Keep as text
+                            row_data[clean_header] = cell_text if cell_text else ""
+                            if debug and i <= 3:
+                                print(f"Keeping '{cell_text}' as text for column '{header}'")
+                        else:  # Try to convert to numeric
+                            converted_value = self.convert_to_number(cell_text, debug=debug and i <= 3)
+                            row_data[clean_header] = converted_value
+                
+                # Only add row if it has meaningful data
+                non_hierarchy_data = {k: v for k, v in row_data.items() 
+                                     if k not in ['Industry_Name', 'Industry', 'Driving_Category', 
+                                                 'Category', 'Sector', 'Sub_Category']}
+                
+                if any(v for v in non_hierarchy_data.values() if v != "" and v is not None):
+                    companies_data.append(row_data)
+                    
+                    if debug and i <= 3:
+                        print(f"Sample row {i}: {dict(list(non_hierarchy_data.items())[:3])}")
+            
+            if debug:
+                print(f"Extracted {len(companies_data)} companies")
+                
+        except Exception as e:
+            if debug:
+                print(f"Error extracting company data: {str(e)}")
+            else:
+                print(f"Error extracting company data: {str(e)}")
+        
+        return companies_data
+    
+    def get_industry_links(self):
+        """
+        Get all industry links from the market page
+        """
+        market_url = f"{self.base_url}/market/"
+        
+        try:
+            print("🔍 Fetching industry list from market page...")
+            response = self.session.get(market_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find all industry links
+            industry_links = soup.find_all('a', href=re.compile(r'/market/'))
+            
+            industries = []
+            seen_names = set()
+            
+            for link in industry_links:
+                href = link.get('href')
+                industry_name = link.get_text(strip=True)
+                
+                # Skip invalid links
+                if not href or not industry_name:
+                    continue
+                
+                # Skip sorting/query parameters
+                if '?' in href:
+                    continue
+                
+                # Skip short names or duplicates
+                if len(industry_name) < 2 or industry_name in seen_names:
+                    continue
+                
+                # Skip generic links
+                if industry_name.lower() in ['market', 'industries', 'home', 'login']:
+                    continue
+                
+                # Validate URL structure
+                path_segments = href.strip('/').split('/')
+                if len(path_segments) < 2:
+                    continue
+                
+                full_url = urljoin(self.base_url, href)
+                
+                industries.append({
+                    'name': industry_name,
+                    'url': full_url,
+                    'href': href
+                })
+                
+                seen_names.add(industry_name)
+            
+            print(f"   Found {len(industries)} valid industry links")
+            return industries
+            
+        except Exception as e:
+            print(f"❌ Error fetching industry links: {str(e)}")
+            return []
+    
+    def test_single_industry(self, debug=True):
+        """
+        Test extraction on a single industry
+        """
+        industries = self.get_industry_links()
+        
+        if not industries:
+            print("❌ No industries found to test")
+            return None
+        
+        # Use first industry for testing
+        test_industry = industries[0]
+        
+        print(f"\n🧪 Testing with: {test_industry['name']}")
+        print(f"   URL: {test_industry['url']}")
+        
+        try:
+            response = self.session.get(test_industry['url'], timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract hierarchy
+            hierarchy = self.extract_breadcrumb_hierarchy(soup, debug=debug)
+            
+            # Extract company data
+            companies_data = self.extract_company_data(soup, test_industry['name'], hierarchy, debug=debug)
+            
+            return {
+                'industry': test_industry,
+                'hierarchy': hierarchy,
+                'companies_data': companies_data
+            }
+            
+        except Exception as e:
+            print(f"❌ Error testing industry: {str(e)}")
+            return None
+    
+    def scrape_all_industries(self, excel_filename):
+        """
+        Scrape all industries and their company data
+        """
+        print("\n" + "="*70)
+        print("🚀 STARTING FULL INDUSTRY & COMPANY DATA SCRAPING")
+        print("="*70)
+        
+        # Ensure we're logged in
+        if not self.logged_in:
+            print("⚠️ Not logged in, attempting login first...")
+            if not self.login():
+                print("❌ Login failed, proceeding without authentication...")
+        
+        industries = self.get_industry_links()
+        
+        if not industries:
+            print("❌ No industries found!")
+            return None
+        
+        all_company_data = []
+        processed_count = 0
+        total_companies = 0
+        failed_industries = []
+        
+        print(f"📊 Processing {len(industries)} industries...")
+        
+        for industry in industries:
+            processed_count += 1
+            
+            try:
+                print(f"\n[{processed_count}/{len(industries)}] Processing: {industry['name']}")
+                print(f"    URL: {industry['url']}")
+                
+                response = self.session.get(industry['url'], timeout=30)
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Extract hierarchy
+                hierarchy = self.extract_breadcrumb_hierarchy(soup, debug=False)
+                hierarchy_display = " > ".join([h for h in [
+                    hierarchy['Driving_Category'], 
+                    hierarchy['Category'], 
+                    hierarchy['Sector'], 
+                    hierarchy['Sub_Category']
+                ] if h])
+                
+                print(f"    📂 Hierarchy: {hierarchy_display}")
+                
+                # Extract company data
+                companies_data = self.extract_company_data(soup, industry['name'], hierarchy, debug=False)
+                
+                if companies_data:
+                    all_company_data.extend(companies_data)
+                    total_companies += len(companies_data)
+                    print(f"    ✅ Found {len(companies_data)} companies (Total: {total_companies})")
+                else:
+                    print(f"    ⚠️ No companies found")
+                    failed_industries.append(industry['name'])
+                
+                # Be respectful to the server
+                time.sleep(2)
+                
+            except Exception as e:
+                print(f"    ❌ Error processing {industry['name']}: {str(e)}")
+                failed_industries.append(industry['name'])
+                continue
+        
+        # Create and save DataFrame
+        if all_company_data:
+            print(f"\n🎉 DATA EXTRACTION COMPLETED!")
+            print(f"   📊 Industries processed: {processed_count}")
+            print(f"   🏢 Total companies: {len(all_company_data)}")
+            print(f"   ❌ Failed industries: {len(failed_industries)}")
+            
+            if failed_industries:
+                print(f"   Failed: {', '.join(failed_industries[:5])}" + 
+                      (f" and {len(failed_industries)-5} more..." if len(failed_industries) > 5 else ""))
+            
+            return self.save_to_excel(all_company_data, excel_filename)
+        else:
+            print("❌ No data extracted!")
+            return None
+    
+    def save_to_excel(self, companies_data, filename):
+        """
+        Save data to Excel with proper formatting and data types
+        """
+        try:
+            df = pd.DataFrame(companies_data)
+            
+            # Add global serial number
+            df['Global_S_No'] = range(1, len(df) + 1)
+            
+            # Intelligent data type handling - preserve text where appropriate
+            identifier_columns = ['Global_S_No', 'Industry_Name', 'Industry', 
+                                'Driving_Category', 'Category', 'Sector', 'Sub_Category']
+            
+            # Analyze and convert columns appropriately
+            for col in df.columns:
+                if col not in identifier_columns and col in df.columns:
+                    # Check sample values to determine if this should be text or numeric
+                    sample_values = df[col].dropna().head(10)
+                    
+                    if len(sample_values) == 0:
+                        continue
+                    
+                    # Count how many look like company names vs numbers
+                    company_name_count = 0
+                    numeric_looking_count = 0
+                    
+                    for val in sample_values:
+                        if self.is_likely_company_name(val):
+                            company_name_count += 1
+                        elif isinstance(val, (int, float)) or (isinstance(val, str) and 
+                                                              any(char.isdigit() for char in str(val))):
+                            numeric_looking_count += 1
+                    
+                    # If more than 70% look like company names, keep as text
+                    if company_name_count / len(sample_values) > 0.7:
+                        # Keep as text - don't convert
+                        print(f"   📝 Keeping column '{col}' as text (company names detected)")
+                        continue
+                    else:
+                        # Try to convert to numeric, but preserve text values that should stay as text
+                        print(f"   🔢 Converting column '{col}' to numeric (where appropriate)")
+                        df[col] = df[col].apply(lambda x: self.convert_to_number(x) if pd.notna(x) else None)
+            
+            # Reorder columns
+            other_columns = [col for col in df.columns if col not in identifier_columns]
+            final_columns = identifier_columns + other_columns
+            final_columns = [col for col in final_columns if col in df.columns]
+            df = df[final_columns]
+            
+            print(f"\n💾 Saving data to: {filename}")
+            
+            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+                # Main data sheet
+                df.to_excel(writer, sheet_name='All_Companies_Data', index=False)
+                
+                # Summary sheet
+                summary_df = df.groupby(['Industry_Name', 'Driving_Category', 'Category', 
+                                       'Sector', 'Sub_Category']).size().reset_index(name='Company_Count')
+                summary_df['Summary_S_No'] = range(1, len(summary_df) + 1)
+                summary_df = summary_df[['Summary_S_No'] + [col for col in summary_df.columns if col != 'Summary_S_No']]
+                summary_df.to_excel(writer, sheet_name='Industry_Summary', index=False)
+                
+                # Company Names Analysis sheet
+                company_name_analysis = []
+                for col in df.columns:
+                    if col not in identifier_columns:
+                        sample_vals = df[col].dropna().head(10)
+                        text_vals = [v for v in sample_vals if isinstance(v, str)]
+                        numeric_vals = [v for v in sample_vals if isinstance(v, (int, float))]
+                        
+                        company_name_analysis.append({
+                            'Column_Name': col,
+                            'Total_Non_Null': df[col].count(),
+                            'Text_Values': len(text_vals),
+                            'Numeric_Values': len(numeric_vals),
+                            'Text_Percentage': round((len(text_vals) / len(sample_vals) * 100), 1) if sample_vals else 0,
+                            'Sample_Text_Values': str(text_vals[:3]) if text_vals else '',
+                            'Sample_Numeric_Values': str(numeric_vals[:3]) if numeric_vals else ''
+                        })
+                
+                analysis_df = pd.DataFrame(company_name_analysis)
+                analysis_df.to_excel(writer, sheet_name='Data_Analysis', index=False)
+                
+                # Format the sheets
+                self._format_excel_sheets(writer, df, summary_df, analysis_df)
+            
+            print(f"✅ SUCCESS! Data saved to {filename}")
+            print(f"📊 Total companies: {len(df)}")
+            print(f"📂 Industries: {len(summary_df)}")
+            
+            # Display detailed analysis
+            print(f"\n📋 COLUMN ANALYSIS:")
+            for _, row in analysis_df.iterrows():
+                col_name = row['Column_Name']
+                text_pct = row['Text_Percentage']
+                text_count = row['Text_Values']
+                numeric_count = row['Numeric_Values']
+                
+                if text_pct > 70:
+                    print(f"   📝 {col_name}: {text_pct}% text ({text_count} text, {numeric_count} numeric) - TEXT COLUMN")
+                elif text_pct > 30:
+                    print(f"   ⚠️ {col_name}: {text_pct}% text ({text_count} text, {numeric_count} numeric) - MIXED COLUMN")
+                else:
+                    print(f"   🔢 {col_name}: {text_pct}% text ({text_count} text, {numeric_count} numeric) - NUMERIC COLUMN")
+            
+            # Show company name preservation
+            text_heavy_columns = analysis_df[analysis_df['Text_Percentage'] > 50]
+            if len(text_heavy_columns) > 0:
+                print(f"\n✅ COMPANY NAMES PRESERVED in {len(text_heavy_columns)} columns:")
+                for _, row in text_heavy_columns.iterrows():
+                    sample_text = row['Sample_Text_Values']
+                    if sample_text and sample_text != '[]':
+                        print(f"   📝 {row['Column_Name']}: {sample_text}")
+            
+            return df
+            
+        except Exception as e:
+            print(f"❌ Error saving Excel file: {str(e)}")
+            return None
+    
+    def _format_excel_sheets(self, writer, df, summary_df, analysis_df):
+        """
+        Apply formatting to Excel sheets
+        """
+        try:
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+            from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1, FORMAT_PERCENTAGE_00
+            
+            # Header formatting
+            header_font = Font(bold=True, color='FFFFFF')
+            header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+            
+            # Format main sheet
+            if 'All_Companies_Data' in writer.sheets:
+                ws = writer.sheets['All_Companies_Data']
+                
+                for cell in ws[1]:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+                
+                # Apply number formatting to numeric columns only
+                for col_idx, col_name in enumerate(df.columns, 1):
+                    col_letter = get_column_letter(col_idx)
+                    
+                    # Check if column is primarily numeric
+                    sample_vals = df[col_name].dropna().head(10)
+                    if len(sample_vals) > 0:
+                        numeric_count = sum(1 for val in sample_vals if isinstance(val, (int, float)))
+                        if numeric_count / len(sample_vals) > 0.7:  # More than 70% numeric
+                            # Check if it's likely a percentage column
+                            if 'percent' in col_name.lower() or '%' in col_name:
+                                for row in range(2, ws.max_row + 1):
+                                    cell = ws[f'{col_letter}{row}']
+                                    if cell.value is not None and isinstance(cell.value, (int, float)):
+                                        cell.number_format = FORMAT_PERCENTAGE_00
+                            else:
+                                # Format as number with commas for large numbers
+                                for row in range(2, ws.max_row + 1):
+                                    cell = ws[f'{col_letter}{row}']
+                                    if cell.value is not None and isinstance(cell.value, (int, float)):
+                                        if abs(cell.value) >= 1000:
+                                            cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
+                                        else:
+                                            cell.number_format = '0.00'
+                
+                # Column widths
+                column_widths = {
+                    'A': 12, 'B': 35, 'C': 12, 'D': 25, 'E': 35, 'F': 20, 'G': 20
+                }
+                
+                for col_letter, width in column_widths.items():
+                    ws.column_dimensions[col_letter].width = width
+                
+                # Auto-width for other columns
+                for i in range(8, min(len(df.columns) + 1, 30)):
+                    ws.column_dimensions[get_column_letter(i)].width = 15
+            
+            # Format other sheets
+            for sheet_name in ['Industry_Summary', 'Data_Analysis']:
+                if sheet_name in writer.sheets:
+                    ws = writer.sheets[sheet_name]
+                    
+                    for cell in ws[1]:
+                        cell.font = header_font
+                        cell.fill = header_fill
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                    
+                    # Auto-adjust column widths
+                    for col in ws.columns:
+                        max_length = 0
+                        column = col[0].column_letter
+                        for cell in col:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except:
+                                pass
+                        adjusted_width = min(max_length + 2, 50)
+                        ws.column_dimensions[column].width = adjusted_width
+                    
+        except Exception as e:
+            print(f"⚠️ Warning: Could not apply Excel formatting: {str(e)}")
+
+
+def validate_extraction():
+    """
+    Test and validate the extraction process with proper company name preservation
+    """
+    scraper = ScreenerScraper()
+    
+    while True:
+        print("\n" + "="*70)
+        print("🧪 TESTING ENHANCED SCRAPER WITH COMPANY NAME PRESERVATION")
+        print("="*70)
+        
+        # Login first
+        if not scraper.login():
+            print("❌ Login failed. Continue anyway? (y/n): ", end="")
+            if input().strip().lower() != 'y':
+                return False
+        
+        # Test company name detection function first
+        print("\n🏢 TESTING COMPANY NAME DETECTION:")
+        test_values = [
+            "Reliance Industries Ltd",     # Should stay as text
+            "Tata Consultancy Services",   # Should stay as text  
+            "HDFC Bank Ltd",              # Should stay as text
+            "Infosys Limited",            # Should stay as text
+            "ITC",                        # Should stay as text (ticker)
+            "RELIANCE",                   # Should stay as text (ticker)
+            "1,23,456",                   # Should convert to number
+            "12.5Cr",                     # Should convert to number
+            "15.67%",                     # Should convert to number
+            "₹2,50,000",                  # Should convert to number
+            "N/A",                        # Should convert to 0
+            "123.45",                     # Should convert to number
+            "Bajaj Auto",                 # Should stay as text
+            "State Bank of India",        # Should stay as text
+            "Asian Paints Ltd",           # Should stay as text
+        ]
+        
+        for test_val in test_values:
+            is_company = scraper.is_likely_company_name(test_val, debug=False)
+            converted = scraper.convert_to_number(test_val, debug=False)
+            val_type = type(converted).__name__
+            
+            if is_company:
+                print(f"   📝 '{test_val}' -> KEPT AS TEXT -> '{converted}' ({val_type})")
+            else:
+                print(f"   🔢 '{test_val}' -> CONVERTED -> {converted} ({val_type})")
+        
+        print("\n" + "-"*50)
+        
+        # Test extraction
+        test_result = scraper.test_single_industry(debug=True)
+        
+        if not test_result:
+            print("❌ Test failed!")
+            return False
+        
+        industry = test_result['industry']
+        hierarchy = test_result['hierarchy']
+        companies_data = test_result['companies_data']
+        
+        # Display results
+        print(f"\n📋 RESULTS for '{industry['name']}':")
+        print("-" * 50)
+        print(f"🏗️ HIERARCHY:")
+        for key, value in hierarchy.items():
+            print(f"   {key}: {value if value else '(Not found)'}")
+        
+        print(f"\n📊 COMPANY DATA:")
+        print(f"   Total companies: {len(companies_data)}")
+        
+        if companies_data:
+            df_sample = pd.DataFrame(companies_data)
+            print(f"   Columns found: {list(df_sample.columns)}")
+            
+            # Analyze company name preservation
+            print(f"\n🏢 COMPANY NAME PRESERVATION ANALYSIS:")
+            identifier_cols = ['Industry_Name', 'Industry', 'Driving_Category', 
+                             'Category', 'Sector', 'Sub_Category']
+            
+            for col in df_sample.columns:
+                if col not in identifier_cols:
+                    non_null_values = df_sample[col].dropna()
+                    if len(non_null_values) > 0:
+                        text_count = sum(1 for val in non_null_values if isinstance(val, str))
+                        numeric_count = sum(1 for val in non_null_values if isinstance(val, (int, float)))
+                        text_percentage = (text_count / len(non_null_values)) * 100
+                        
+                        # Show sample values
+                        sample_text = [v for v in non_null_values[:3] if isinstance(v, str)]
+                        sample_numeric = [v for v in non_null_values[:3] if isinstance(v, (int, float))]
+                        
+                        status = "📝 TEXT PRESERVED" if text_percentage > 70 else \
+                                "⚠️ MIXED" if text_percentage > 30 else "🔢 NUMERIC"
+                        
+                        print(f"   {status} | {col}: {text_percentage:.0f}% text ({text_count}T/{numeric_count}N)")
+                        if sample_text:
+                            print(f"       📝 Text samples: {sample_text}")
+                        if sample_numeric:
+                            print(f"       🔢 Numeric samples: {sample_numeric}")
+            
+            print(f"\n🔍 SAMPLE COMPANIES (showing company names):")
+            for i, row in df_sample.head(3).iterrows():
+                # Find the company name column
+                company_name = "Unknown Company"
+                for col, val in row.items():
+                    if col not in identifier_cols and isinstance(val, str) and len(str(val)) > 5:
+                        # Check if this looks like a company name
+                        if scraper.is_likely_company_name(val):
+                            company_name = val
+                            break
+                
+                print(f"\n   Company {i+1}: {company_name}")
+                print(f"     Industry: {row['Industry_Name']}")
+                
+                # Show a few other data points
+                other_data = {}
+                count = 0
+                for col, val in row.items():
+                    if col not in identifier_cols and col not in [company_name] and count < 4:
+                        other_data[col] = f"{val} ({type(val).__name__})"
+                        count += 1
+                
+                for col, val_info in other_data.items():
+                    print(f"     {col}: {val_info}")
+        
+        # Validation questions
+        print("\n" + "="*70)
+        print("✅ VALIDATION CHECKLIST:")
+        print("   • Are company names preserved as text? (Should see 📝 TEXT PRESERVED)")
+        print("   • Are financial numbers converted properly? (Should see 🔢 NUMERIC)")
+        print("   • Do the sample companies show actual company names?")
+        print("   • Are ticker symbols (like 'RELIANCE', 'ITC') preserved as text?")
+        
+        while True:
+            response = input("\n✅ Are company names being preserved correctly? (yes/no/quit): ").strip().lower()
+            
+            if response in ['yes', 'y']:
+                return True
+            elif response in ['no', 'n']:
+                print("🔄 Let me check what went wrong...")
+                # Show detailed debugging for first company
+                if companies_data:
+                    first_company = companies_data[0]
+                    print(f"\n🔍 DEBUGGING FIRST COMPANY:")
+                    for col, val in first_company.items():
+                        if col not in ['Industry_Name', 'Industry', 'Driving_Category', 
+                                     'Category', 'Sector', 'Sub_Category']:
+                            val_type = type(val).__name__
+                            is_company = scraper.is_likely_company_name(val) if isinstance(val, str) else False
+                            print(f"   {col}: '{val}' ({val_type}) - Company name: {is_company}")
+                break
+            elif response in ['quit', 'q', 'exit']:
+                return False
+            else:
+                print("Please enter 'yes', 'no', or 'quit'")
+
+
+def main():
+    """
+    Main function to run the enhanced scraper with proper company name preservation
+    """
+    print("🚀 Enhanced Screener.in Scraper - COMPANY NAME PRESERVATION")
+    print("="*70)
+    print("🎯 Goal: Preserve company names as text, convert financial data to numbers")
+    print("="*70)
+    
+    # Validate extraction
+    if not validate_extraction():
+        print("❌ Validation failed. Exiting.")
+        return
+    
+    # Get filename
+    while True:
+        filename = input("\n📁 Enter Excel filename (e.g., 'screener_data.xlsx'): ").strip()
+        
+        if not filename:
+            print("Please enter a valid filename.")
+            continue
+        
+        if not filename.lower().endswith('.xlsx'):
+            filename += '.xlsx'
+        
+        print(f"✅ Will save to: {filename}")
+        break
+    
+    # Start full scraping
+    scraper = ScreenerScraper()
+    
+    print(f"\n🚀 Starting full extraction with company name preservation...")
+    df = scraper.scrape_all_industries(filename)
+    
+    if df is not None:
+        print(f"\n🎉 SCRAPING COMPLETED SUCCESSFULLY!")
+        print(f"📊 Final dataset contains {len(df)} companies")
+        
+        # Show final company name preservation stats
+        print(f"\n🏢 FINAL COMPANY NAME PRESERVATION STATS:")
+        identifier_cols = ['Global_S_No', 'Industry_Name', 'Industry', 'Driving_Category', 
+                          'Category', 'Sector', 'Sub_Category']
+        
+        text_columns = []
+        numeric_columns = []
+        mixed_columns = []
+        
+        for col in df.columns:
+            if col not in identifier_cols:
+                sample_vals = df[col].dropna().head(20)
+                if len(sample_vals) > 0:
+                    text_count = sum(1 for val in sample_vals if isinstance(val, str))
+                    text_pct = (text_count / len(sample_vals)) * 100
+                    
+                    if text_pct > 70:
+                        text_columns.append(col)
+                    elif text_pct > 20:
+                        mixed_columns.append(col)
+                    else:
+                        numeric_columns.append(col)
+        
+        print(f"   📝 Text-heavy columns (company names): {len(text_columns)}")
+        print(f"   🔢 Numeric columns (financial data): {len(numeric_columns)}")
+        print(f"   ⚠️ Mixed columns: {len(mixed_columns)}")
+        
+        if text_columns:
+            print(f"\n📝 Company name columns: {text_columns}")
+            
+            # Show sample company names
+            print(f"\n🏢 Sample company names found:")
+            for col in text_columns[:3]:  # Show first 3 text columns
+                sample_names = df[col].dropna().head(5).tolist()
+                company_names = [name for name in sample_names if scraper.is_likely_company_name(name)]
+                if company_names:
+                    print(f"   {col}: {company_names}")
+        
+        print(f"\n📋 Data saved to {filename} with preserved company names!")
+        print(f"🎯 Mission: Preserve company names while converting financial data - COMPLETED!")
+    else:
+        print(f"\n❌ Scraping failed.")
+
+
+if __name__ == "__main__":
+    main()
