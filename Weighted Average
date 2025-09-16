@@ -1,0 +1,608 @@
+import pandas as pd
+import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED1, FORMAT_PERCENTAGE_00
+import warnings
+warnings.filterwarnings('ignore')
+
+class WeightedAverageAnalyzer:
+    def __init__(self):
+        # Financial metrics to calculate weighted averages for
+        self.financial_metrics = [
+            'Profit_Var_3YrsPercent', 'Profit_Var_5YrsPercent', '3Yrs_returnPercent', 
+            '5Yrs_returnPercent', 'ROCEPercent', 'Asset_Turnover', 'PEG', 
+            'Piotski_Scr', 'P_E'
+        ]
+        
+        # These columns need to be divided by 100 before calculation
+        self.percentage_metrics = [
+            'Profit_Var_3YrsPercent', 'Profit_Var_5YrsPercent', 
+            '3Yrs_returnPercent', '5Yrs_returnPercent', 'ROCEPercent'
+        ]
+        
+        # Filter columns that also need to be divided by 100
+        self.filter_percentage_metrics = ['PledgedPercent', 'Prom_HoldPercent']
+        
+        # Columns to group by (one sheet for each)
+        self.grouping_columns = ['Driving_Category', 'Category', 'Sector', 'Sub_Category']
+        
+        # Filter settings
+        self.apply_filters = False
+    
+    def ask_for_filter_preference(self):
+        """
+        Ask user if they want to apply filters
+        """
+        print("\n🔍 FILTER OPTION")
+        print("="*50)
+        print("📊 Available filters:")
+        print("   • PledgedPercent > 1% → Exclude company")
+        print("   • Prom_HoldPercent < 50% → Exclude company")
+        print("="*50)
+        
+        while True:
+            response = input("\n❓ Do you want to apply filters? (yes/no): ").strip().lower()
+            
+            if response in ['yes', 'y', '1', 'true']:
+                self.apply_filters = True
+                print("✅ Filters will be applied!")
+                print("   📝 Companies with PledgedPercent > 1% will be excluded")
+                print("   📝 Companies with Prom_HoldPercent < 50% will be excluded")
+                break
+            elif response in ['no', 'n', '0', 'false']:
+                self.apply_filters = False
+                print("✅ No filters will be applied - using all companies")
+                break
+            else:
+                print("❌ Please enter 'yes' or 'no'")
+    
+    def load_and_validate_data(self, filename):
+        """
+        Load Excel file and validate required columns
+        """
+        try:
+            print(f"📖 Loading data from: {filename}")
+            
+            # Try to load the main data sheet
+            sheet_names = pd.ExcelFile(filename).sheet_names
+            print(f"   Found sheets: {sheet_names}")
+            
+            # Look for the main data sheet
+            main_sheet = None
+            for sheet_name in ['All_Companies_Data', 'Sheet1', 'Data']:
+                if sheet_name in sheet_names:
+                    main_sheet = sheet_name
+                    break
+            
+            if not main_sheet:
+                main_sheet = sheet_names[0]  # Use first sheet as fallback
+            
+            print(f"   Using sheet: {main_sheet}")
+            df = pd.read_excel(filename, sheet_name=main_sheet)
+            
+            print(f"   Loaded {len(df)} rows with {len(df.columns)} columns")
+            
+            # Validate required columns
+            missing_columns = []
+            
+            # Check for market cap column (it might have different names)
+            market_cap_column = None
+            market_cap_variants = ['Mar_CapRsCr', 'Market_Cap', 'MarketCap', 'Mar_Cap', 'Market_CapRsCr']
+            
+            for variant in market_cap_variants:
+                if variant in df.columns:
+                    market_cap_column = variant
+                    break
+            
+            if not market_cap_column:
+                print(f"   ❌ Market cap column not found. Looking for: {market_cap_variants}")
+                return None, None
+            
+            print(f"   ✅ Using market cap column: {market_cap_column}")
+            
+            # Check grouping columns
+            for col in self.grouping_columns:
+                if col not in df.columns:
+                    missing_columns.append(col)
+            
+            # Check financial metric columns
+            available_metrics = []
+            for metric in self.financial_metrics:
+                if metric in df.columns:
+                    available_metrics.append(metric)
+                else:
+                    print(f"   ⚠️ Missing financial metric: {metric}")
+            
+            if not available_metrics:
+                print("   ❌ No financial metrics found!")
+                return None, None
+            
+            # Check filter columns if filters are enabled
+            if self.apply_filters:
+                missing_filter_cols = []
+                for col in self.filter_percentage_metrics:
+                    if col not in df.columns:
+                        missing_filter_cols.append(col)
+                
+                if missing_filter_cols:
+                    print(f"   ❌ Missing filter columns: {missing_filter_cols}")
+                    print(f"   💡 Either add these columns or run without filters")
+                    return None, None
+                else:
+                    print(f"   ✅ Found filter columns: {self.filter_percentage_metrics}")
+            
+            if missing_columns:
+                print(f"   ❌ Missing required columns: {missing_columns}")
+                return None, None
+            
+            print(f"   ✅ Found {len(available_metrics)} financial metrics: {available_metrics}")
+            
+            # Update financial metrics to only include available ones
+            self.financial_metrics = available_metrics
+            # Also update percentage metrics to only include available ones
+            self.percentage_metrics = [metric for metric in self.percentage_metrics if metric in available_metrics]
+            
+            return df, market_cap_column
+            
+        except Exception as e:
+            print(f"   ❌ Error loading file: {str(e)}")
+            return None, None
+    
+    def clean_and_convert_data(self, df, market_cap_column):
+        """
+        Clean data and convert percentages to decimals
+        """
+        print("🧹 Cleaning and converting data...")
+        
+        # Clean market cap column
+        df[market_cap_column] = pd.to_numeric(df[market_cap_column], errors='coerce')
+        
+        # Clean financial metrics
+        for metric in self.financial_metrics:
+            df[metric] = pd.to_numeric(df[metric], errors='coerce')
+        
+        # Clean filter columns if filters are enabled
+        if self.apply_filters:
+            for metric in self.filter_percentage_metrics:
+                df[metric] = pd.to_numeric(df[metric], errors='coerce')
+        
+        # CRITICAL: Convert percentage columns by dividing by 100
+        print(f"📊 Converting percentage columns to decimals (dividing by 100):")
+        
+        # Convert financial percentage metrics
+        for metric in self.percentage_metrics:
+            if metric in df.columns:
+                # Show sample before conversion
+                sample_before = df[metric].dropna().head(3)
+                print(f"   {metric}:")
+                print(f"      Before: {list(sample_before.values)} (as stored)")
+                
+                # Divide by 100 to convert percentage to decimal
+                df[metric] = df[metric] / 100
+                
+                # Show sample after conversion
+                sample_after = df[metric].dropna().head(3)
+                print(f"      After:  {list(sample_after.round(4).values)} (divided by 100)")
+                print(f"      This means: {list((sample_after * 100).round(2).values)}% -> {list(sample_after.round(4).values)} decimal")
+        
+        # Convert filter percentage metrics if filters are enabled
+        if self.apply_filters:
+            print(f"📊 Converting filter percentage columns to decimals (dividing by 100):")
+            for metric in self.filter_percentage_metrics:
+                if metric in df.columns:
+                    # Show sample before conversion
+                    sample_before = df[metric].dropna().head(3)
+                    print(f"   {metric}:")
+                    print(f"      Before: {list(sample_before.values)} (as stored)")
+                    
+                    # Divide by 100 to convert percentage to decimal
+                    df[metric] = df[metric] / 100
+                    
+                    # Show sample after conversion
+                    sample_after = df[metric].dropna().head(3)
+                    print(f"      After:  {list(sample_after.round(4).values)} (divided by 100)")
+        
+        # Remove rows where market cap is null or zero
+        initial_count = len(df)
+        df = df[df[market_cap_column].notna() & (df[market_cap_column] > 0)]
+        market_cap_filtered_count = len(df)
+        
+        print(f"   Removed {initial_count - market_cap_filtered_count} rows with invalid market cap")
+        
+        return df
+    
+    def apply_company_filters(self, df):
+        """
+        Apply filters to exclude companies based on PledgedPercent and Prom_HoldPercent
+        """
+        if not self.apply_filters:
+            return df
+        
+        print("\n🔍 APPLYING COMPANY FILTERS")
+        print("="*50)
+        
+        initial_count = len(df)
+        
+        # Filter 1: Exclude companies with PledgedPercent > 1% (0.01 in decimal)
+        if 'PledgedPercent' in df.columns:
+            pledged_before = len(df)
+            df = df[(df['PledgedPercent'].isna()) | (df['PledgedPercent'] <= 0.01)]
+            pledged_after = len(df)
+            pledged_removed = pledged_before - pledged_after
+            
+            print(f"📊 PledgedPercent Filter:")
+            print(f"   • Excluded companies with PledgedPercent > 1%")
+            print(f"   • Removed: {pledged_removed} companies")
+            print(f"   • Remaining: {pledged_after} companies")
+        
+        # Filter 2: Exclude companies with Prom_HoldPercent < 50% (0.50 in decimal)
+        if 'Prom_HoldPercent' in df.columns:
+            promoter_before = len(df)
+            df = df[(df['Prom_HoldPercent'].isna()) | (df['Prom_HoldPercent'] >= 0.50)]
+            promoter_after = len(df)
+            promoter_removed = promoter_before - promoter_after
+            
+            print(f"📊 Prom_HoldPercent Filter:")
+            print(f"   • Excluded companies with Prom_HoldPercent < 50%")
+            print(f"   • Removed: {promoter_removed} companies")
+            print(f"   • Remaining: {promoter_after} companies")
+        
+        final_count = len(df)
+        total_removed = initial_count - final_count
+        
+        print(f"\n📋 FILTER SUMMARY:")
+        print(f"   • Started with: {initial_count:,} companies")
+        print(f"   • Total removed: {total_removed:,} companies")
+        print(f"   • Final count: {final_count:,} companies")
+        print(f"   • Retention rate: {(final_count/initial_count)*100:.1f}%")
+        
+        return df
+    
+    def calculate_weighted_averages_for_group(self, df, group_column, market_cap_column):
+        """
+        Calculate weighted averages for each unique value in the group column
+        """
+        print(f"📊 Calculating weighted averages for: {group_column}")
+        
+        # Get unique values, removing null/empty values
+        unique_values = df[group_column].dropna().unique()
+        unique_values = [val for val in unique_values if str(val).strip() and str(val).lower() != 'nan']
+        unique_values = sorted(unique_values)
+        
+        print(f"   Found {len(unique_values)} unique {group_column} values")
+        
+        results = []
+        
+        for value in unique_values:
+            # Filter data for this group
+            group_data = df[df[group_column] == value].copy()
+            
+            if len(group_data) == 0:
+                continue
+            
+            # Calculate total market cap for this group
+            total_market_cap = group_data[market_cap_column].sum()
+            
+            if total_market_cap <= 0:
+                continue
+            
+            # Start building the result row
+            row_data = {group_column: value}
+            
+            # Calculate weighted averages for each metric
+            for metric in self.financial_metrics:
+                # Get valid data points (non-null values)
+                valid_data = group_data[group_data[metric].notna()].copy()
+                
+                if len(valid_data) > 0:
+                    # Get weights (market caps) and values for this metric
+                    weights = valid_data[market_cap_column]
+                    values = valid_data[metric]
+                    
+                    # Calculate weighted average: sum(value * weight) / sum(weights)
+                    weighted_sum = (values * weights).sum()
+                    total_weight = weights.sum()
+                    
+                    if total_weight > 0:
+                        weighted_avg = weighted_sum / total_weight
+                        row_data[metric] = weighted_avg
+                    else:
+                        row_data[metric] = None
+                else:
+                    row_data[metric] = None
+            
+            # Add summary statistics
+            row_data['Total_Companies'] = len(group_data)
+            row_data['Total_Market_Cap_Cr'] = total_market_cap
+            
+            results.append(row_data)
+        
+        # Convert to DataFrame
+        result_df = pd.DataFrame(results)
+        
+        if len(result_df) > 0:
+            # Sort by total market cap descending
+            result_df = result_df.sort_values('Total_Market_Cap_Cr', ascending=False)
+            result_df = result_df.reset_index(drop=True)
+            
+            print(f"   ✅ Generated {len(result_df)} weighted average records")
+        
+        return result_df
+    
+    def format_excel_sheet(self, worksheet, df, sheet_title):
+        """
+        Apply professional formatting to Excel sheet
+        """
+        try:
+            # Header formatting
+            header_font = Font(bold=True, color='FFFFFF', size=11)
+            header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+            center_alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Apply header formatting
+            for col_num in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=1, column=col_num)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = center_alignment
+            
+            # Format percentage columns (these are the ones we divided by 100)
+            for metric in self.percentage_metrics:
+                if metric in df.columns:
+                    col_idx = list(df.columns).index(metric) + 1
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for row in range(2, len(df) + 2):
+                        cell = worksheet[f'{col_letter}{row}']
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            # Values are decimals (e.g., 0.15), Excel will show as 15.00%
+                            cell.number_format = '0.00%'
+            
+            # Format market cap column
+            if 'Total_Market_Cap_Cr' in df.columns:
+                col_idx = list(df.columns).index('Total_Market_Cap_Cr') + 1
+                col_letter = get_column_letter(col_idx)
+                
+                for row in range(2, len(df) + 2):
+                    cell = worksheet[f'{col_letter}{row}']
+                    if cell.value is not None and isinstance(cell.value, (int, float)):
+                        cell.number_format = FORMAT_NUMBER_COMMA_SEPARATED1
+            
+            # Format other numeric columns (non-percentage)
+            numeric_columns = ['Asset_Turnover', 'PEG', 'Piotski_Scr', 'P_E', 'Total_Companies']
+            for col_name in numeric_columns:
+                if col_name in df.columns:
+                    col_idx = list(df.columns).index(col_name) + 1
+                    col_letter = get_column_letter(col_idx)
+                    
+                    for row in range(2, len(df) + 2):
+                        cell = worksheet[f'{col_letter}{row}']
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            if col_name == 'Total_Companies':
+                                cell.number_format = '0'  # Integer format
+                            else:
+                                cell.number_format = '0.00'  # Two decimal places
+            
+            # Auto-adjust column widths
+            for col in worksheet.columns:
+                max_length = 0
+                column_letter = col[0].column_letter
+                
+                for cell in col:
+                    try:
+                        cell_length = len(str(cell.value)) if cell.value is not None else 0
+                        if cell_length > max_length:
+                            max_length = cell_length
+                    except:
+                        pass
+                
+                # Set minimum and maximum widths
+                adjusted_width = min(max(max_length + 2, 12), 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"   ✅ Applied formatting to {sheet_title}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Warning: Could not apply formatting to {sheet_title}: {str(e)}")
+    
+    def generate_weighted_analysis(self, input_filename):
+        """
+        Main function to generate weighted average analysis with 4 sheets
+        """
+        print("\n" + "="*80)
+        print("🏢 MARKET CAP WEIGHTED AVERAGE ANALYSIS GENERATOR")
+        print("="*80)
+        print("📊 Creating 4 sheets with weighted averages based on market capitalization")
+        print("⚖️ Percentage columns will be divided by 100 before calculation")
+        if self.apply_filters:
+            print("🔍 Filters will be applied:")
+            print("   • PledgedPercent > 1% → Companies excluded")
+            print("   • Prom_HoldPercent < 50% → Companies excluded")
+        else:
+            print("📈 No filters - all companies will be included")
+        print("="*80)
+        
+        # Load and validate data
+        df, market_cap_column = self.load_and_validate_data(input_filename)
+        
+        if df is None:
+            print("❌ Failed to load and validate data!")
+            return False
+        
+        # Clean and convert data
+        df = self.clean_and_convert_data(df, market_cap_column)
+        
+        if len(df) == 0:
+            print("❌ No valid data remaining after cleaning!")
+            return False
+        
+        # Apply filters if enabled
+        df = self.apply_company_filters(df)
+        
+        if len(df) == 0:
+            print("❌ No companies remaining after applying filters!")
+            return False
+        
+        # Generate output filename
+        filter_suffix = "_Filtered" if self.apply_filters else ""
+        output_filename = input_filename.replace('.xlsx', f'{filter_suffix}_WeightedAnalysis.xlsx')
+        print(f"\n📁 Output will be saved as: {output_filename}")
+        
+        # Create Excel writer
+        with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
+            
+            # Generate one sheet for each grouping column
+            for group_column in self.grouping_columns:
+                print(f"\n📈 Processing {group_column}...")
+                
+                # Calculate weighted averages for this grouping
+                result_df = self.calculate_weighted_averages_for_group(df, group_column, market_cap_column)
+                
+                if len(result_df) > 0:
+                    # Create sheet name
+                    sheet_name = group_column.replace('_', ' ')
+                    
+                    # Write to Excel
+                    result_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    
+                    # Apply formatting
+                    worksheet = writer.sheets[sheet_name]
+                    self.format_excel_sheet(worksheet, result_df, sheet_name)
+                    
+                    print(f"   ✅ Created sheet '{sheet_name}' with {len(result_df)} records")
+                    
+                    # Show top 3 entries with calculation examples
+                    print(f"   🔝 Top 3 by market cap:")
+                    for idx, row in result_df.head(3).iterrows():
+                        name = row[group_column]
+                        market_cap = row['Total_Market_Cap_Cr']
+                        companies = row['Total_Companies']
+                        
+                        # Show sample percentage calculation
+                        sample_roce = row.get('ROCEPercent', None)
+                        if sample_roce is not None:
+                            roce_display = f"{sample_roce*100:.2f}%" if sample_roce < 1 else f"{sample_roce:.2f}"
+                            print(f"      {idx+1}. {name}: ₹{market_cap:,.0f} Cr ({companies} companies) - ROCE: {roce_display}")
+                        else:
+                            print(f"      {idx+1}. {name}: ₹{market_cap:,.0f} Cr ({companies} companies)")
+                
+                else:
+                    print(f"   ⚠️ No data generated for {group_column}")
+        
+        print(f"\n🎉 ANALYSIS COMPLETED!")
+        print(f"📊 Generated weighted average analysis in: {output_filename}")
+        print(f"📈 Created {len(self.grouping_columns)} analysis sheets")
+        
+        # Summary statistics
+        total_companies = len(df)
+        total_market_cap = df[market_cap_column].sum()
+        
+        print(f"\n📋 SUMMARY:")
+        print(f"   🏢 Total companies analyzed: {total_companies:,}")
+        print(f"   💰 Total market cap: ₹{total_market_cap:,.0f} Cr")
+        print(f"   📊 Financial metrics: {len(self.financial_metrics)}")
+        print(f"   📈 Percentage metrics (÷100): {len(self.percentage_metrics)}")
+        print(f"   🗂️ Analysis sheets: {len(self.grouping_columns)}")
+        if self.apply_filters:
+            print(f"   🔍 Filters applied: Yes")
+            print(f"       • PledgedPercent > 1% → Excluded")
+            print(f"       • Prom_HoldPercent < 50% → Excluded")
+        else:
+            print(f"   🔍 Filters applied: No")
+        
+        # Show the calculation methodology
+        print(f"\n🧮 CALCULATION METHODOLOGY:")
+        print(f"   📝 Step 1: Load original data")
+        if self.apply_filters:
+            print(f"   🔍 Step 2: Apply filters")
+            print(f"       • Convert PledgedPercent & Prom_HoldPercent to decimals (÷100)")
+            print(f"       • Exclude companies with PledgedPercent > 1%")
+            print(f"       • Exclude companies with Prom_HoldPercent < 50%")
+            print(f"   📊 Step 3: Convert financial percentages to decimals (÷100)")
+        else:
+            print(f"   📊 Step 2: Convert percentages to decimals (÷100)")
+        print(f"       • Example: 20% ROCE → 0.20 decimal")
+        next_step = 4 if self.apply_filters else 3
+        print(f"   ⚖️ Step {next_step}: Calculate weighted averages")
+        print(f"       • Formula: Σ(metric × market_cap) / Σ(market_cap)")
+        print(f"       • Example: (0.20×10000 + 0.15×5000) / 15000 = 0.1833")
+        print(f"   📈 Step {next_step+1}: Excel displays decimals as percentages")
+        print(f"       • 0.1833 → 18.33% in Excel")
+        
+        print(f"\n✅ SUCCESS! Open {output_filename} to view your weighted average analysis.")
+        if self.apply_filters:
+            print(f"🔍 Filters were applied - only high-quality companies included!")
+        print(f"🎯 All percentage columns were properly converted before calculation!")
+        
+        return True
+
+
+def main():
+    """
+    Main function to run the weighted average analysis
+    """
+    print("🚀 MARKET CAP WEIGHTED AVERAGE ANALYZER")
+    print("="*60)
+    print("📊 This tool creates 4 sheets with weighted averages:")
+    print("   • Driving Category")
+    print("   • Category") 
+    print("   • Sector")
+    print("   • Sub Category")
+    print("\n⚖️ Percentage columns are divided by 100 before calculation")
+    print("   (Profit_Var_3Yrs%, Profit_Var_5Yrs%, 3Yrs_return%, 5Yrs_return%, ROCE%)")
+    print("\n🔍 Optional filters available:")
+    print("   • PledgedPercent > 1% → Exclude company") 
+    print("   • Prom_HoldPercent < 50% → Exclude company")
+    print("="*60)
+    
+    # Create analyzer instance
+    analyzer = WeightedAverageAnalyzer()
+    
+    # Ask for filter preference first
+    analyzer.ask_for_filter_preference()
+    
+    # Get input filename
+    while True:
+        filename = input("\n📁 Enter the Excel filename to analyze: ").strip()
+        
+        if not filename:
+            print("❌ Please enter a filename.")
+            continue
+        
+        # Add .xlsx extension if missing
+        if not filename.lower().endswith('.xlsx'):
+            filename += '.xlsx'
+        
+        # Check if file exists
+        try:
+            pd.read_excel(filename, nrows=1)
+            print(f"✅ File found: {filename}")
+            break
+        except FileNotFoundError:
+            print(f"❌ File not found: {filename}")
+            print("   Please make sure the file exists in the current directory.")
+            continue
+        except Exception as e:
+            print(f"❌ Error reading file: {str(e)}")
+            continue
+    
+    # Run analysis
+    success = analyzer.generate_weighted_analysis(filename)
+    
+    if success:
+        print(f"\n🎯 MISSION ACCOMPLISHED!")
+        if analyzer.apply_filters:
+            print(f"   Your filtered weighted average analysis is ready!")
+        else:
+            print(f"   Your weighted average analysis is ready!")
+        print(f"   Percentage handling and calculations are properly implemented!")
+    else:
+        print(f"\n❌ Analysis failed. Please check your data and try again.")
+    
+    input(f"\nPress Enter to exit...")
+
+
+if __name__ == "__main__":
+    main()
