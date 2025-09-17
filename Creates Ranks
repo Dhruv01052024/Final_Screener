@@ -129,6 +129,59 @@ class RankingAnalyzer:
         
         return df
     
+    def handle_negative_ratios(self, df, column_name, rank_column_name):
+        """
+        Handle negative PE and PEG ratios by assigning them rank 0 (worst rank)
+        """
+        print(f"🔍 Handling negative values in {column_name}...")
+        
+        if column_name not in df.columns:
+            return df
+        
+        # Count negative values
+        negative_count = (df[column_name] < 0).sum()
+        total_valid = df[column_name].notna().sum()
+        
+        if negative_count > 0:
+            print(f"   Found {negative_count} negative values out of {total_valid} total values")
+            
+            # Create mask for negative values
+            negative_mask = df[column_name] < 0
+            
+            # Calculate ranks for positive values only
+            positive_data = df[column_name].copy()
+            positive_data[negative_mask] = np.nan  # Temporarily set negative values to NaN
+            
+            # Rank positive values (ascending=True means lower positive values get better ranks)
+            positive_ranks = positive_data.rank(ascending=True, na_option='keep')
+            
+            # Assign ranks
+            df[rank_column_name] = positive_ranks
+            
+            # Set negative values to worst rank (0)
+            df.loc[negative_mask, rank_column_name] = 0
+            
+            print(f"   ✅ Assigned rank 0 to {negative_count} negative values")
+            print(f"   ✅ Ranked {total_valid - negative_count} positive values from 1 to {(total_valid - negative_count)}")
+            
+            # Show examples
+            if negative_count > 0:
+                negative_examples = df[negative_mask][column_name].head(3)
+                for idx, val in negative_examples.items():
+                    print(f"      Negative example: {val:.2f} → Rank: 0")
+            
+            positive_examples = df[~negative_mask & df[column_name].notna()].head(3)
+            for idx, row in positive_examples.iterrows():
+                val = row[column_name]
+                rank = row[rank_column_name]
+                print(f"      Positive example: {val:.2f} → Rank: {rank:.1f}")
+        else:
+            # No negative values, rank normally
+            df[rank_column_name] = df[column_name].rank(ascending=True, na_option='bottom')
+            print(f"   No negative values found, ranked normally")
+        
+        return df
+    
     def calculate_rankings(self, df):
         """
         Calculate rankings for all relevant columns
@@ -137,16 +190,16 @@ class RankingAnalyzer:
         
         ranking_columns = []
         
-        # PEG and PE - lower is better, get average rank
+        # PEG and PE - lower is better, but negative values get rank 0
         peg_col = self.find_column_name(df, 'peg')
         pe_col = self.find_column_name(df, 'pe')
         
         if peg_col and pe_col:
-            print(f"📊 Ranking PEG and PE (lower is better)...")
+            print(f"📊 Ranking PEG and PE (lower is better, negative = worst rank)...")
             
-            # Create individual rankings (ascending=True means lower values get rank 1)
-            df['PEG_Rank'] = df[peg_col].rank(ascending=True, na_option='bottom')
-            df['PE_Rank'] = df[pe_col].rank(ascending=True, na_option='bottom')
+            # Handle negative values and create individual rankings
+            df = self.handle_negative_ratios(df, peg_col, 'PEG_Rank')
+            df = self.handle_negative_ratios(df, pe_col, 'PE_Rank')
             
             # Calculate average rank for PEG and PE
             df['PEG_PE_Avg_Rank'] = (df['PEG_Rank'] + df['PE_Rank']) / 2
@@ -195,13 +248,15 @@ class RankingAnalyzer:
         
         # Calculate total rank (sum of all individual ranks)
         if ranking_columns:
-            print(f"\n🎯 Calculating Total Rank from {len(ranking_columns)} ranking columns...")
-            df['Total_Rank_Score'] = df[ranking_columns].sum(axis=1, skipna=True)
+            print(f"\n🎯 Calculating Combined Rank Score from {len(ranking_columns)} ranking columns...")
+            df['Combined_Rank_Score'] = df[ranking_columns].sum(axis=1, skipna=True)
             
-            # Final ranking - higher total rank score gets better rank
-            df['Final_Rank'] = df['Total_Rank_Score'].rank(ascending=False, na_option='bottom')
+            # Final ranking - LOWER combined score gets BETTER final rank
+            # This ensures that lower individual ranks (which are better) result in better final ranks
+            df['Final_Rank'] = df['Combined_Rank_Score'].rank(ascending=True, na_option='bottom')
             
-            print(f"   ✅ Created Total_Rank_Score and Final_Rank")
+            print(f"   ✅ Created Combined_Rank_Score and Final_Rank")
+            print(f"   📍 Logic: Lower Combined_Rank_Score = Better Final_Rank")
             
             # Show top 3 final rankings
             top_rankings = df.nsmallest(3, 'Final_Rank')
@@ -211,8 +266,8 @@ class RankingAnalyzer:
             for idx, row in top_rankings.iterrows():
                 name = row[grouping_col]
                 final_rank = row['Final_Rank']
-                total_score = row['Total_Rank_Score']
-                print(f"   {final_rank:.0f}. {name} (Total Score: {total_score:.1f})")
+                combined_score = row['Combined_Rank_Score']
+                print(f"   {final_rank:.0f}. {name} (Combined Score: {combined_score:.1f})")
         
         return df
     
@@ -308,6 +363,8 @@ class RankingAnalyzer:
         print("📊 Adding calculated columns and rankings to weighted analysis")
         print("🧮 New columns: Profit-Return differences for 3yr and 5yr")
         print("🏅 Rankings: PEG/PE average + individual metrics + final combined rank")
+        print("🚫 Special handling: Negative PE/PEG ratios get rank 0 (worst)")
+        print("📈 Final Rank: Lower combined score = Better final rank")
         print("="*80)
         
         # Load the weighted analysis file
@@ -337,7 +394,7 @@ class RankingAnalyzer:
             if 'Final_Rank' in processed_df.columns:
                 processed_df = processed_df.sort_values('Final_Rank', ascending=True)
                 processed_df = processed_df.reset_index(drop=True)
-                print(f"   ✅ Sorted by Final_Rank")
+                print(f"   ✅ Sorted by Final_Rank (ascending - best ranks first)")
             
             processed_sheets[sheet_name] = processed_df
             print(f"   ✅ Sheet processing completed")
@@ -384,9 +441,9 @@ def main():
     print("   • Rankings: Individual metric rankings") 
     print("   • Final combined ranking")
     print("\n🎯 Ranking Logic:")
-    print("   • PEG & PE: Lower is better")
+    print("   • PEG & PE: Lower is better, Negative = Rank 0 (worst)")
     print("   • ROCE, Asset Turnover, Piotroski, Differences: Higher is better")
-    print("   • Final Rank: Based on sum of all individual ranks")
+    print("   • Final Rank: Lower combined score = Better final rank")
     print("="*60)
     
     # Create analyzer instance
@@ -434,6 +491,7 @@ def main():
         print(f"\n🎯 MISSION ACCOMPLISHED!")
         print(f"   Your ranked analysis is ready with comprehensive rankings!")
         print(f"   All metrics have been properly ranked and combined into a final score!")
+        print(f"   Negative PE/PEG ratios are handled with rank 0 (worst rank)!")
     else:
         print(f"\n❌ Analysis failed. Please check your data and try again.")
     
